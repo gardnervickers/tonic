@@ -181,8 +181,14 @@ impl Server {
         Router::new(self.clone(), svc)
     }
 
-    pub(crate) async fn serve<S>(self, addr: SocketAddr, svc: S) -> Result<(), super::Error>
+    pub(crate) async fn serve_with_listener<S, L, C>(
+        self,
+        mut listener: L,
+        svc: S,
+    ) -> Result<(), super::Error>
     where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+        L: Stream<Item = Result<C, std::io::Error>> + Unpin,
         S: Service<Request<Body>, Response = Response<BoxBody>> + Clone + Send + 'static,
         S::Future: Send + 'static,
         S::Error: Into<crate::Error> + Send,
@@ -193,15 +199,12 @@ impl Server {
         let init_stream_window_size = self.init_stream_window_size;
         let max_concurrent_streams = self.max_concurrent_streams;
         // let timeout = self.timeout.clone();
-
-        let incoming = hyper::server::accept::from_stream(async_stream::try_stream! {
-            let mut tcp = TcpIncoming::bind(addr)?;
-
-            while let Some(stream) = tcp.try_next().await? {
+        let listener = async_stream::try_stream! {
+            while let Some(stream) = listener.try_next().await? {
                 #[cfg(feature = "tls")]
                 {
                     if let Some(tls) = &self.tls {
-                        let io = match tls.connect(stream.into_inner()).await {
+                        let io = match tls.connect(stream).await {
                             Ok(io) => io,
                             Err(error) => {
                                 error!(message = "Unable to accept incoming connection.", %error);
@@ -212,11 +215,10 @@ impl Server {
                         continue;
                     }
                 }
-
                 yield BoxedIo::new(stream);
             }
-        });
-
+        };
+        let incoming = hyper::server::accept::from_stream(listener);
         let svc = MakeSvc {
             inner: svc,
             interceptor,
@@ -301,7 +303,24 @@ where
     ///
     /// [`Server`]: struct.Server.html
     pub async fn serve(self, addr: SocketAddr) -> Result<(), super::Error> {
-        self.server.serve(addr, self.routes).await
+        let tcp = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| super::Error::from_source(super::ErrorKind::Server, Box::new(e)))?;
+        self.server
+            .serve_with_listener(tcp.incoming(), self.routes)
+            .await
+    }
+
+    /// Consume this [`Server`] creating a future that will execute the server
+    /// on [`tokio`]'s default executor.
+    ///
+    /// [`Server`]: struct.Server.html
+    pub async fn serve_from_stream<L, C>(self, listener: L) -> Result<(), super::Error>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
+        L: Stream<Item = Result<C, std::io::Error>> + Unpin,
+    {
+        self.server.serve_with_listener(listener, self.routes).await
     }
 }
 
@@ -416,32 +435,6 @@ impl ServerTlsConfig {
                 ),
                 Some(config) => TlsAcceptor::new_with_rustls_raw(config.clone()),
             },
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TcpIncoming {
-    inner: conn::AddrIncoming,
-}
-
-impl TcpIncoming {
-    fn bind(addr: SocketAddr) -> Result<Self, crate::Error> {
-        let mut inner = conn::AddrIncoming::bind(&addr).map_err(Box::new)?;
-        inner.set_nodelay(true);
-
-        Ok(Self { inner })
-    }
-}
-
-impl Stream for TcpIncoming {
-    type Item = Result<conn::AddrStream, crate::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(Accept::poll_accept(Pin::new(&mut self.inner), cx)) {
-            Some(Ok(s)) => Poll::Ready(Some(Ok(s))),
-            Some(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            None => Poll::Ready(None),
         }
     }
 }

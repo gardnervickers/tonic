@@ -304,7 +304,10 @@ impl TlsAcceptor {
         })
     }
 
-    pub(crate) async fn connect(&self, io: TcpStream) -> Result<BoxedIo, crate::Error> {
+    pub(crate) async fn connect<T>(&self, io: T) -> Result<BoxedIo, crate::Error>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let io = match &self.inner {
             #[cfg(feature = "openssl")]
             Acceptor::Openssl(acceptor) => {
